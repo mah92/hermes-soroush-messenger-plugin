@@ -161,6 +161,7 @@ class SoroushAdapter(BasePlatformAdapter):
         self._poll_task: Optional[asyncio.Task] = None
         self._running: bool = False
         self._last_update_id: int = 0
+        self._typing_sent: dict[str, float] = {}  # chat_id -> last sendChatAction time
 
         # Chat allowlist (comma-separated chat IDs). Empty = allow all chats.
         self._allowed_chats: set[str] = set()
@@ -478,9 +479,18 @@ class SoroushAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """Show \"typing...\" indicator via sendChatAction."""
+        """Show \"typing...\" indicator via sendChatAction.
+
+        Soroush rate-limits sendChatAction (429 Too Many Requests), so we
+        throttle to at most one call per chat every SEND_CHAT_ACTION_MIN_INTERVAL.
+        """
         if not self._http:
             return
+        now = asyncio.get_event_loop().time()
+        last = self._typing_sent.get(chat_id, 0.0)
+        if now - last < 5.0:
+            return
+        self._typing_sent[chat_id] = now
         try:
             await self._api_post("sendChatAction", {"chat_id": chat_id, "action": "typing"})
         except Exception:
