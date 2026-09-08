@@ -1,17 +1,17 @@
 """
 Soroush Plus (سروش پلاس) platform adapter for Hermes Gateway.
 
-Connects via PySPlusthon — a Python library for the official Soroush Plus
-Bot API (https://api.splus.ir/bot<TOKEN>/...).
+Direct Bot API implementation (Telegram-compatible REST), NO third-party
+SDK. Official docs: https://soroushplus.com/p/documents/bot-platform
 
-This is the BOT mode (like Telegram/Bale BotFather):
-  - Get a bot token from Soroush Plus (via their bot/developer channel)
-  - Set SOROUSH_BOT_TOKEN in ~/.hermes/.env
-  - The adapter long-polls getUpdates and delivers messages to Hermes.
+  endpoint: https://api.splus.ir/bot<token>/<METHOD>
+  getUpdates long-polling (like Bale/Telegram Bot API)
 
-NOTE: Soroush has no public self-serve BotFather like Telegram/Bale yet —
-tokens are issued through Soroush's official bot/developer channels
-(see https://splus.ir/PySPlusthonDevelopers or Soroush's business portal).
+Setup
+-----
+1. Create bot via splus.ir/botfather (official Soroush bot maker)
+2. Copy the token
+3. Set SOROUSH_BOT_TOKEN in ~/.hermes/.env
 """
 
 from __future__ import annotations
@@ -24,12 +24,52 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("gateway.platforms.soroush")
 
+API_BASE = "https://api.splus.ir"
 MAX_MESSAGE_LENGTH = 4000
+POLL_TIMEOUT = 30
 POLL_INTERVAL = 2.0
 
 
 def _get_env(key: str, default: str = "") -> str:
     return (os.getenv(key) or default).strip()
+
+
+def _api_url(token: str, method: str) -> str:
+    return f"{API_BASE}/bot{token}/{method}"
+
+
+def _guess_mime(path: str, fallback: str) -> str:
+    """Guess a proper MIME type for a downloaded file."""
+    import mimetypes
+
+    guessed, _ = mimetypes.guess_type(path)
+    if guessed:
+        return guessed
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".ogg":
+        return "audio/ogg"
+    if ext == ".opus":
+        return "audio/ogg"
+    if ext in (".mp3", ".wav", ".m4a", ".aac", ".flac"):
+        return "audio/mpeg" if ext == ".mp3" else "audio/ogg"
+    if ext in (".jpg", ".jpeg"):
+        return "image/jpeg"
+    if ext == ".png":
+        return "image/png"
+    if ext in (".mp4", ".mov", ".webm"):
+        return "video/mp4" if ext == ".mp4" else f"video/{ext[1:]}"
+    return fallback
+
+
+def _looks_like_timeout(error: str) -> bool:
+    err = (error or "").lower()
+    return any(
+        marker in err
+        for marker in (
+            "timeout", "timed out", "timedout", "request timed",
+            "deadline exceeded", "asyncio.timeouterror", "socket.timeout",
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -66,9 +106,8 @@ def interactive_setup() -> None:
     env_path = os.path.expanduser("~/.hermes/.env")
     print("\n  📲 Soroush Plus Bot Setup (سروش پلاس)")
     print("  ─────────────────────────────────────")
-    print("  1. Open Soroush Plus and go to the official bot channel")
-    print("     (e.g. https://splus.ir/PySPlusthonDevelopers)")
-    print("  2. Request a bot token (Soroush issues tokens officially)")
+    print("  1. Open https://splus.ir/botfather in Soroush app")
+    print("  2. Create a bot and copy its token")
     print("  3. Paste the token here\n")
 
     token = input("  Bot Token: ").strip()
@@ -103,7 +142,7 @@ from gateway.session import SessionSource
 
 
 class SoroushAdapter(BasePlatformAdapter):
-    """Soroush Plus bot adapter via PySPlusthon (Bot API)."""
+    """Soroush Plus bot adapter via official REST Bot API (no SDK)."""
 
     supports_code_blocks: bool = False
     supports_status_text: bool = False
@@ -118,7 +157,12 @@ class SoroushAdapter(BasePlatformAdapter):
         self._bot_id: str = ""
         self._bot_username: str = ""
 
-        # Allowlists
+        self._http: Any = None
+        self._poll_task: Optional[asyncio.Task] = None
+        self._running: bool = False
+        self._last_update_id: int = 0
+
+        # Chat allowlist (comma-separated chat IDs). Empty = allow all chats.
         self._allowed_chats: set[str] = set()
         chats_env = str(extra.get("allowed_chats") or _get_env("SOROUSH_ALLOWED_CHATS") or "")
         for raw in chats_env.split(","):
@@ -126,6 +170,7 @@ class SoroushAdapter(BasePlatformAdapter):
             if cid:
                 self._allowed_chats.add(cid)
 
+        # User allowlist (comma-separated user IDs). Empty = allow all users.
         _allow_all = str(
             extra.get("allow_all_users") or _get_env("SOROUSH_ALLOW_ALL_USERS") or ""
         ).strip().lower() in ("true", "1", "yes", "on")
@@ -137,11 +182,14 @@ class SoroushAdapter(BasePlatformAdapter):
                 if uid:
                     self._allowed_users.add(uid)
 
-        # Runtime state
-        self._client: Any = None
-        self._poll_task: Optional[asyncio.Task] = None
-        self._running: bool = False
-        self._last_update_id: int = 0
+        # require_mention gate (default: off). When enabled in groups,
+        # messages without @mention are collected as context and prepended
+        # to the next triggered message (like Telegram/Bale).
+        _rm = extra.get("require_mention")
+        if _rm is None:
+            _rm = _get_env("SOROUSH_REQUIRE_MENTION")
+        self._require_mention = str(_rm).strip().lower() in ("true", "1", "yes", "on")
+        self._pending_context: dict[str, list[tuple[str, str]]] = {}
 
     # ------------------------------------------------------------------
     # connect / disconnect
@@ -155,40 +203,38 @@ class SoroushAdapter(BasePlatformAdapter):
             return False
 
         try:
-            from PySPlusthon import Client
+            import aiohttp
+
+            self._http = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30.0),
+                trust_env=True,
+            )
         except ImportError:
-            logger.error("[soroush] PySPlusthon required: pip install PySPlusthon")
+            logger.error("[soroush] aiohttp required: pip install aiohttp")
             return False
 
+        # Verify token via getMe
         try:
-            self._client = Client(self._token)
+            data = await self._api_get("getMe")
+            self._bot_id = str(data.get("result", {}).get("id", ""))
+            self._bot_username = data.get("result", {}).get("username", "")
+            logger.info(
+                "[soroush] Connected as @%s (id=%s)",
+                self._bot_username, self._bot_id,
+            )
         except Exception as exc:
-            logger.error("[soroush] Client init failed: %s", exc)
+            logger.error("[soroush] getMe failed: %s", exc)
+            await self._http.close()
+            self._http = None
             return False
 
+        # Clear any existing webhook (polling won't work with webhook set)
         try:
-            await self._client.initialize()
-            await self._client.connect()
-            me = await self._client.get_me()
-            if me:
-                self._bot_id = str(getattr(me, "id", "") or "")
-                self._bot_username = str(getattr(me, "username", "") or "")
-                logger.info(
-                    "[soroush] Connected as @%s (id=%s)",
-                    self._bot_username, self._bot_id,
-                )
-            elif self._client.user:
-                self._bot_id = str(getattr(self._client.user, "id", "") or "")
-                self._bot_username = str(getattr(self._client.user, "username", "") or "")
-                logger.info(
-                    "[soroush] Connected as @%s (id=%s) [cached]",
-                    self._bot_username, self._bot_id,
-                )
-        except Exception as exc:
-            logger.error("[soroush] getMe/init failed: %s", exc)
-            await self._safe_shutdown()
-            return False
+            await self._api_get("deleteWebhook")
+        except Exception:
+            pass
 
+        # Start polling loop
         self._running = True
         self._poll_task = asyncio.create_task(self._poll_loop())
         logger.info("[soroush] Polling started")
@@ -196,6 +242,7 @@ class SoroushAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         self._running = False
+
         if self._poll_task:
             self._poll_task.cancel()
             try:
@@ -203,31 +250,25 @@ class SoroushAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
             self._poll_task = None
-        await self._safe_shutdown()
-        logger.info("[soroush] Disconnected")
 
-    async def _safe_shutdown(self) -> None:
-        if self._client:
+        if self._http:
             try:
-                await self._client.disconnect()
+                await self._http.close()
             except Exception:
                 pass
-            try:
-                await self._client.shutdown()
-            except Exception:
-                pass
-            self._client = None
+            self._http = None
+
+        logger.info("[soroush] Disconnected")
 
     # ------------------------------------------------------------------
     # Polling loop
     # ------------------------------------------------------------------
 
     async def _poll_loop(self) -> None:
+        """Long-poll for updates from Soroush."""
         while self._running:
             try:
-                updates = await self._client.get_updates(
-                    offset=self._last_update_id + 1,
-                )
+                updates = await self._get_updates()
                 for upd in updates:
                     await self._handle_update(upd)
             except asyncio.CancelledError:
@@ -236,146 +277,155 @@ class SoroushAdapter(BasePlatformAdapter):
                 logger.debug("[soroush] Poll error: %s", exc)
                 await asyncio.sleep(POLL_INTERVAL)
 
+    async def _get_updates(self) -> List[dict]:
+        """Fetch updates via getUpdates with offset."""
+        params = {"offset": self._last_update_id + 1, "timeout": POLL_TIMEOUT}
+        data = await self._api_get("getUpdates", params=params)
+        return data.get("result", []) or []
+
     async def _download_media(self, file_id: str) -> Optional[str]:
-        """Download a file from Soroush servers to a local temp path."""
+        """Download a file from Soroush servers via getFile + file URL."""
         import tempfile
 
         try:
-            file_data = await self._client.get_file(file_id)
-            if not file_data:
+            file_data = await self._api_get("getFile", {"file_id": file_id})
+            if not file_data.get("ok"):
+                logger.warning("[soroush] getFile failed: %s", file_data.get("description"))
                 return None
-            # PySPlusthon download returns bytes
-            data = await self._client.download(file_id)
-            if not data:
-                return None
-            ext = os.path.splitext(str(getattr(file_data, "file_path", "") or ""))[1] or ".bin"
+            file_path = file_data["result"]["file_path"]
+            file_url = f"{API_BASE}/file/bot{self._token}/{file_path}"
+
+            ext = os.path.splitext(file_path)[1] or ".bin"
             fd, local_path = tempfile.mkstemp(suffix=ext.lower())
             os.close(fd)
-            with open(local_path, "wb") as f:
-                f.write(data)
+
+            async with self._http.get(file_url) as resp:
+                if resp.status != 200:
+                    logger.warning("[soroush] Download failed: HTTP %s", resp.status)
+                    os.unlink(local_path)
+                    return None
+                with open(local_path, "wb") as f:
+                    f.write(await resp.read())
+
             logger.debug("[soroush] Downloaded media to %s", local_path)
             return local_path
         except Exception as exc:
             logger.warning("[soroush] Media download error: %s", exc)
             return None
 
-    async def _handle_update(self, upd: Any) -> None:
-        """Process a single update object from PySPlusthon."""
-        # NOTE: PySPlusthon's Update object stores its id as `.id`, NOT
-        # `.update_id` (Telegram-style). Reading .update_id always returns 0,
-        # which keeps our offset stuck and getUpdates re-delivers the same
-        # messages forever -> busy-mode loop + status-message spam.
-        update_id = int(getattr(upd, "id", 0) or 0)
+    async def _handle_update(self, upd: dict) -> None:
+        """Process a single update dict."""
+        update_id = upd.get("update_id", 0)
         if update_id:
             self._last_update_id = max(self._last_update_id, update_id)
 
-        msg = getattr(upd, "message", None)
+        msg = upd.get("message") or upd.get("edited_message")
         if not msg:
             return
 
-        chat = getattr(msg, "chat", None)
-        # PySPlusthon Message exposes the sender as `author` (a User object),
-        # NOT `from_user` (Telegram-style). Use author first, then fallbacks.
-        sender = getattr(msg, "author", None) or getattr(msg, "sender_chat", None)
-        chat_id = str(getattr(chat, "id", "") or "")
-        # Chat.type is a ChatType enum; normalize to a plain string.
-        _raw_chat_type = getattr(chat, "type", None)
-        if _raw_chat_type is not None and not isinstance(_raw_chat_type, str):
-            _raw_chat_type = _raw_chat_type.value if hasattr(_raw_chat_type, "value") else str(_raw_chat_type)
-        chat_type = str(_raw_chat_type or "dm")
+        chat = msg.get("chat", {})
+        sender = msg.get("from", {})
+        chat_id = str(chat.get("id", ""))
+        chat_type = chat.get("type", "dm")
 
-        user_id = str(getattr(sender, "id", "") or "") if sender else ""
-        user_name = (
-            (getattr(sender, "first_name", None) or getattr(sender, "username", None) or user_id)
-            if sender else user_id
-        )
-        text = getattr(msg, "text", None) or getattr(msg, "caption", None) or ""
-        msg_id = str(getattr(msg, "id", "") or getattr(msg, "message_id", "") or "")
+        user_id = str(sender.get("id", ""))
+        user_name = sender.get("first_name") or sender.get("username") or user_id
+        text = msg.get("text") or msg.get("caption") or ""
 
-        # CRITICAL: never echo our own bot's messages. Soroush's getUpdates
-        # returns the bot's own outgoing sends too; without this filter the
-        # bot replies to itself in an infinite loop (observed: "Dropping
-        # busy-mode follow-up ... pending queue at cap (32)").
-        if user_id and user_id == self._bot_id:
-            logger.debug("[soroush] Skipping own bot message id=%s (loop guard)", msg_id)
-            return
+        msg_id = str(msg.get("message_id", ""))
 
-        # Ignore /start pings entirely: they create an active session and
-        # the gateway treats them as platform pings, which triggers status
-        # message spam on Soroush.
-        if text.strip().lower().startswith("/start"):
-            logger.debug("[soroush] Ignoring /start from %s", user_id)
-            return
-
-        # Allowlists
+        # Chat allowlist: drop messages from chats outside the allowed set
         if self._allowed_chats and chat_id not in self._allowed_chats:
-            logger.info("[soroush] Ignoring chat %s (not allowed)", chat_id)
-            return
-        if self._allowed_users and user_id not in self._allowed_users:
-            logger.info("[soroush] Ignoring user %s (not allowed)", user_id)
+            logger.info("[soroush] Ignoring message from non-allowed chat %s (user=%s)", chat_id, user_name)
             return
 
-        # Message type + media
+        # User allowlist: drop messages from users outside the allowed set
+        if self._allowed_users and user_id not in self._allowed_users:
+            logger.info("[soroush] Ignoring message from non-allowed user %s (%s)", user_id, user_name)
+            return
+
+        # Message type and media downloads
         mt = MessageType.TEXT
         media_urls: List[str] = []
         media_types: List[str] = []
 
-        def _file_id(obj: Any) -> str:
-            return str(getattr(obj, "file_id", "") or "")
+        if msg.get("photo"):
+            mt = MessageType.PHOTO
+            photos = sorted(msg["photo"], key=lambda p: p.get("file_size", 0))
+            if photos:
+                file_id = photos[-1].get("file_id", "")
+                if file_id:
+                    local = await self._download_media(file_id)
+                    if local:
+                        media_urls.append(local)
+                        media_types.append(_guess_mime(local, "image/jpeg"))
+        elif msg.get("video"):
+            mt = MessageType.VIDEO
+            file_id = msg["video"].get("file_id", "")
+            if file_id:
+                local = await self._download_media(file_id)
+                if local:
+                    media_urls.append(local)
+                    media_types.append(_guess_mime(local, "video/mp4"))
+        elif msg.get("voice"):
+            mt = MessageType.VOICE
+            file_id = msg["voice"].get("file_id", "")
+            if file_id:
+                local = await self._download_media(file_id)
+                if local:
+                    media_urls.append(local)
+                    media_types.append(
+                        str(msg["voice"].get("mime_type") or "audio/ogg").lower()
+                    )
+        elif msg.get("audio"):
+            _a_mime = str(msg["audio"].get("mime_type") or "").lower()
+            _voice_like = ("ogg" in _a_mime) or ("opus" in _a_mime)
+            mt = MessageType.VOICE if _voice_like else MessageType.AUDIO
+            file_id = msg["audio"].get("file_id", "")
+            if file_id:
+                local = await self._download_media(file_id)
+                if local:
+                    media_urls.append(local)
+                    media_types.append(_a_mime or ("audio/ogg" if _voice_like else "audio/mpeg"))
+        elif msg.get("document"):
+            mt = MessageType.DOCUMENT
+            file_id = msg["document"].get("file_id", "")
+            if file_id:
+                local = await self._download_media(file_id)
+                if local:
+                    media_urls.append(local)
+                    media_types.append(
+                        str(msg["document"].get("mime_type") or "application/octet-stream").lower()
+                    )
+        elif msg.get("location"):
+            mt = MessageType.LOCATION
 
-        try:
-            if getattr(msg, "photo", None):
-                photos = getattr(msg, "photo", None)
-                if photos:
-                    largest = photos[-1]
-                    fid = _file_id(largest)
-                    if fid:
-                        local = await self._download_media(fid)
-                        if local:
-                            mt = MessageType.PHOTO
-                            media_urls.append(local)
-                            media_types.append("image/jpeg")
-            elif getattr(msg, "voice", None):
-                fid = _file_id(getattr(msg, "voice", None))
-                if fid:
-                    local = await self._download_media(fid)
-                    if local:
-                        mt = MessageType.VOICE
-                        media_urls.append(local)
-                        media_types.append("audio/ogg")
-            elif getattr(msg, "audio", None):
-                fid = _file_id(getattr(msg, "audio", None))
-                if fid:
-                    local = await self._download_media(fid)
-                    if local:
-                        mt = MessageType.AUDIO
-                        media_urls.append(local)
-                        media_types.append("audio/mpeg")
-            elif getattr(msg, "video", None):
-                fid = _file_id(getattr(msg, "video", None))
-                if fid:
-                    local = await self._download_media(fid)
-                    if local:
-                        mt = MessageType.VIDEO
-                        media_urls.append(local)
-                        media_types.append("video/mp4")
-            elif getattr(msg, "document", None):
-                fid = _file_id(getattr(msg, "document", None))
-                if fid:
-                    local = await self._download_media(fid)
-                    if local:
-                        mt = MessageType.DOCUMENT
-                        media_urls.append(local)
-                        media_types.append("application/octet-stream")
-        except Exception as exc:
-            logger.warning("[soroush] Media handling error: %s", exc)
+        # require_mention gate: in groups, buffer non-mention messages as context
+        channel_context = None
+        if chat_type in ("group", "supergroup") and self._require_mention:
+            bot_mention = f"@{self._bot_username}"
+            reply_to = msg.get("reply_to_message", {})
+            is_reply_to_bot = (
+                str(reply_to.get("from", {}).get("id", "")) == self._bot_id
+            )
+            is_mention = bot_mention.lower() in text.lower()
+            if not is_mention and not is_reply_to_bot:
+                self._pending_context.setdefault(chat_id, []).append((user_name, text))
+                if len(self._pending_context[chat_id]) > 50:
+                    self._pending_context[chat_id] = self._pending_context[chat_id][-50:]
+                return
+            else:
+                buf = self._pending_context.pop(chat_id, [])
+                if buf:
+                    lines = [f"[{un}] {tx}" for un, tx in buf]
+                    channel_context = "[Earlier group messages]\n" + "\n".join(lines)
 
         source = self.build_source(
             chat_id=chat_id,
-            chat_name=str(getattr(chat, "title", None) or getattr(chat, "first_name", None) or chat_id),
+            chat_name=chat.get("first_name") or chat.get("title") or chat_id,
             chat_type=chat_type,
             user_id=user_id,
-            user_name=str(user_name),
+            user_name=user_name,
             message_id=msg_id,
         )
 
@@ -388,7 +438,7 @@ class SoroushAdapter(BasePlatformAdapter):
             timestamp=datetime.now(),
             media_urls=media_urls,
             media_types=media_types,
-            channel_context=None,
+            channel_context=channel_context,
         )
 
         await self.handle_message(event)
@@ -404,34 +454,37 @@ class SoroushAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        if not self._client:
+        if not self._http:
             return SendResult(success=False, error="Not connected")
 
+        payload: Dict[str, Any] = {"chat_id": chat_id, "text": content}
+        if reply_to:
+            payload["reply_to_message_id"] = reply_to
+
         try:
-            msg = await self._client.send_message(
-                chat_id,
-                content,
-                reply_to_message_id=int(reply_to) if reply_to and reply_to.isdigit() else None,
-            )
-            return SendResult(
-                success=True,
-                message_id=str(getattr(msg, "id", "") or getattr(msg, "message_id", "") or ""),
-            )
+            data = await self._api_post("sendMessage", payload)
+            if data.get("ok"):
+                result = data.get("result", {})
+                return SendResult(
+                    success=True,
+                    message_id=str(result.get("message_id", "")),
+                )
+            return SendResult(success=False, error=str(data.get("description", "unknown error")))
         except Exception as exc:
             return SendResult(success=False, error=str(exc))
 
-    async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """Show \"typing...\" indicator (like Bale's sendChatAction).
+    # ------------------------------------------------------------------
+    # send_typing / send_image
+    # ------------------------------------------------------------------
 
-        Attempts Soroush's sendChatAction via raw HTTP; silently ignores
-        failure (some Soroush bot endpoints may not implement it).
-        """
-        if not self._client:
+    async def send_typing(self, chat_id: str, metadata=None) -> None:
+        """Show \"typing...\" indicator via sendChatAction."""
+        if not self._http:
             return
         try:
-            await self._client.execute_http("sendChatAction", {"chat_id": chat_id, "action": "typing"})
-        except Exception as exc:
-            logger.debug("[soroush] sendChatAction failed for %s: %s", chat_id, exc)
+            await self._api_post("sendChatAction", {"chat_id": chat_id, "action": "typing"})
+        except Exception:
+            pass
 
     async def send_image(
         self,
@@ -442,170 +495,72 @@ class SoroushAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
-        if not self._client:
+        if not self._http:
             return SendResult(success=False, error="Not connected")
 
+        payload: Dict[str, Any] = {"chat_id": chat_id, "photo": image_url}
+        if caption:
+            payload["caption"] = caption
+        if reply_to:
+            payload["reply_to_message_id"] = reply_to
+
+        # 1) Try direct URL — Soroush fetches the image server-side
         try:
-            msg = await self._client.send_photo(
-                chat_id,
-                image_url,
-                caption=caption,
-                reply_to_message_id=int(reply_to) if reply_to and reply_to.isdigit() else None,
-            )
-            return SendResult(
-                success=True,
-                message_id=str(getattr(msg, "id", "") or getattr(msg, "message_id", "") or ""),
-            )
-        except Exception as exc:
-            # Fallback: send as text with URL
-            text = (caption or "") + f"\n{image_url}" if (caption and image_url) else (image_url or caption or "")
-            return await self.send(chat_id, text)
+            result = await self._api_post("sendPhoto", payload)
+            if result.get("ok"):
+                sent_msg_id = str(result.get("result", {}).get("message_id", ""))
+                return SendResult(success=True, message_id=sent_msg_id)
+        except Exception:
+            pass
 
-    async def send_document(
-        self,
-        chat_id: str,
-        file_path: str,
-        caption: Optional[str] = None,
-        file_name: Optional[str] = None,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        **kwargs,
-    ) -> SendResult:
-        if not self._client:
-            return SendResult(success=False, error="Not connected")
-        if not os.path.isfile(file_path):
-            return SendResult(success=False, error=f"File not found: {file_path}")
-
+        # 2) Download and upload as multipart (for URLs Soroush can't reach)
         try:
-            msg = await self._client.send_document(
-                chat_id,
-                file_path,
-                caption=caption,
-                reply_to_message_id=int(reply_to) if reply_to and reply_to.isdigit() else None,
-            )
-            return SendResult(
-                success=True,
-                message_id=str(getattr(msg, "id", "") or getattr(msg, "message_id", "") or ""),
-            )
-        except Exception as exc:
-            return SendResult(success=False, error=str(exc))
+            import tempfile
 
-    async def send_photo(
-        self,
-        chat_id: str,
-        file_path: str,
-        caption: Optional[str] = None,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        **kwargs,
-    ) -> SendResult:
-        return await self.send_image(
-            chat_id=chat_id, image_url=file_path, caption=caption,
-            reply_to=reply_to, metadata=metadata, **kwargs,
-        )
+            async with self._http.get(image_url) as resp:
+                if resp.status == 200:
+                    img_data = await resp.read()
+                    fd, tmp = tempfile.mkstemp(suffix=".jpg")
+                    os.close(fd)
+                    with open(tmp, "wb") as f:
+                        f.write(img_data)
 
-    async def send_image_file(
-        self,
-        chat_id: str,
-        image_path: str,
-        caption: Optional[str] = None,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        **kwargs,
-    ) -> SendResult:
-        return await self.send_image(
-            chat_id=chat_id, image_url=image_path, caption=caption,
-            reply_to=reply_to, metadata=metadata, **kwargs,
-        )
+                    mp_data = {"chat_id": chat_id}
+                    if caption:
+                        mp_data["caption"] = caption
+                    result = await self._api_post_multipart("sendPhoto", mp_data, {"photo": tmp})
+                    os.unlink(tmp)
+                    if result.get("ok"):
+                        sent_msg_id = str(result.get("result", {}).get("message_id", ""))
+                        return SendResult(success=True, message_id=sent_msg_id)
+        except Exception:
+            pass
 
-    async def send_video(
-        self,
-        chat_id: str,
-        video_path: str,
-        caption: Optional[str] = None,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        **kwargs,
-    ) -> SendResult:
-        if not self._client:
-            return SendResult(success=False, error="Not connected")
-        if not os.path.isfile(video_path):
-            return SendResult(success=False, error=f"File not found: {video_path}")
-
-        try:
-            msg = await self._client.send_video(
-                chat_id,
-                video_path,
-                caption=caption,
-                reply_to_message_id=int(reply_to) if reply_to and reply_to.isdigit() else None,
-            )
-            return SendResult(
-                success=True,
-                message_id=str(getattr(msg, "id", "") or getattr(msg, "message_id", "") or ""),
-            )
-        except Exception as exc:
-            return SendResult(success=False, error=str(exc))
-
-    async def send_voice(
-        self,
-        chat_id: str,
-        audio_path: str,
-        caption: Optional[str] = None,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        **kwargs,
-    ) -> SendResult:
-        if not self._client:
-            return SendResult(success=False, error="Not connected")
-        if not os.path.isfile(audio_path):
-            return SendResult(success=False, error=f"File not found: {audio_path}")
-
-        try:
-            msg = await self._client.send_voice(
-                chat_id,
-                audio_path,
-                caption=caption,
-                reply_to_message_id=int(reply_to) if reply_to and reply_to.isdigit() else None,
-            )
-            return SendResult(
-                success=True,
-                message_id=str(getattr(msg, "id", "") or getattr(msg, "message_id", "") or ""),
-            )
-        except Exception as exc:
-            return SendResult(success=False, error=str(exc))
-
-    async def send_audio(
-        self,
-        chat_id: str,
-        audio_path: str,
-        caption: Optional[str] = None,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        **kwargs,
-    ) -> SendResult:
-        return await self.send_voice(
-            chat_id=chat_id, audio_path=audio_path, caption=caption,
-            reply_to=reply_to, metadata=metadata, **kwargs,
-        )
+        # 3) Fallback: send as text with URL
+        text = caption or ""
+        if image_url:
+            text = f"{text}\n{image_url}".strip()
+        return await self.send(chat_id, text)
 
     # ------------------------------------------------------------------
-    # get_chat_info / formatting
+    # get_chat_info
     # ------------------------------------------------------------------
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         try:
-            chat = await self._client.get_chat(chat_id)
+            data = await self._api_post("getChat", {"chat_id": chat_id})
+            result = data.get("result", {})
             return {
-                "name": (
-                    getattr(chat, "title", None)
-                    or getattr(chat, "first_name", None)
-                    or str(chat_id)
-                ),
-                "type": getattr(chat, "type", "dm"),
-                "chat_id": str(getattr(chat, "id", chat_id)),
+                "name": result.get("first_name") or result.get("title") or chat_id,
+                "type": result.get("type", "dm"),
+                "chat_id": str(result.get("id", chat_id)),
             }
         except Exception:
             return {"name": str(chat_id), "type": "dm", "chat_id": str(chat_id)}
+
+    # ------------------------------------------------------------------
+    # Utility methods
+    # ------------------------------------------------------------------
 
     @staticmethod
     def format_message(text: str) -> str:
@@ -618,6 +573,7 @@ class SoroushAdapter(BasePlatformAdapter):
         text = re.sub(r"__(.+?)__", r"\1", text)
         text = re.sub(r"_(.+?)_", r"\1", text)
         text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+        text = re.sub(r"`{1,3}[^`]*`{1,3}", "", text)
         return text.strip()
 
     @staticmethod
@@ -632,9 +588,214 @@ class SoroushAdapter(BasePlatformAdapter):
             for k, v in kwargs.items()
         })
 
+    # ------------------------------------------------------------------
+    # Internal HTTP helpers
+    # ------------------------------------------------------------------
+
+    async def _api_get(self, method: str, params: Optional[dict] = None) -> dict:
+        url = _api_url(self._token, method)
+        if params is None:
+            params = {}
+        async with self._http.get(url, params=params) as resp:
+            return await resp.json()
+
+    async def _api_post(self, method: str, data: dict) -> dict:
+        url = _api_url(self._token, method)
+        async with self._http.post(url, json=data) as resp:
+            return await resp.json()
+
+    async def _api_post_multipart(
+        self,
+        method: str,
+        data: dict,
+        files: dict,
+    ) -> dict:
+        """POST with multipart/form-data for file uploads."""
+        import aiohttp
+
+        url = _api_url(self._token, method)
+        form = aiohttp.FormData()
+        for key, value in data.items():
+            form.add_field(key, str(value))
+        for field_name, file_path in files.items():
+            form.add_field(
+                field_name,
+                open(file_path, "rb"),
+                filename=os.path.basename(file_path),
+            )
+        async with self._http.post(url, data=form) as resp:
+            return await resp.json()
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Upload and send a document/file to a Soroush chat."""
+        if not self._http:
+            return SendResult(success=False, error="Not connected")
+        if not os.path.isfile(file_path):
+            return SendResult(success=False, error=f"File not found: {file_path}")
+
+        data = {"chat_id": chat_id}
+        if caption:
+            data["caption"] = caption
+        if reply_to:
+            data["reply_to_message_id"] = reply_to
+        files = {"document": file_path}
+
+        try:
+            result = await self._api_post_multipart("sendDocument", data, files)
+            if result.get("ok"):
+                sent_msg_id = str(result.get("result", {}).get("message_id", ""))
+                return SendResult(success=True, message_id=sent_msg_id)
+            return SendResult(success=False, error=str(result.get("description", "unknown error")))
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc))
+
+    async def send_photo(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Upload and send a photo/image to a Soroush chat."""
+        if not self._http:
+            return SendResult(success=False, error="Not connected")
+        if not os.path.isfile(file_path):
+            return SendResult(success=False, error=f"File not found: {file_path}")
+
+        data = {"chat_id": chat_id}
+        if caption:
+            data["caption"] = caption
+        if reply_to:
+            data["reply_to_message_id"] = reply_to
+        files = {"photo": file_path}
+
+        try:
+            result = await self._api_post_multipart("sendPhoto", data, files)
+            if result.get("ok"):
+                sent_msg_id = str(result.get("result", {}).get("message_id", ""))
+                return SendResult(success=True, message_id=sent_msg_id)
+            return SendResult(success=False, error=str(result.get("description", "unknown error")))
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc))
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send a LOCAL image file via sendPhoto (native upload)."""
+        return await self.send_photo(
+            chat_id=chat_id, file_path=image_path,
+            caption=caption, reply_to=reply_to, metadata=metadata, **kwargs,
+        )
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Upload and send a video via sendVideo API."""
+        if not self._http:
+            return SendResult(success=False, error="Not connected")
+        if not os.path.isfile(video_path):
+            return SendResult(success=False, error=f"File not found: {video_path}")
+
+        data = {"chat_id": chat_id}
+        if caption:
+            data["caption"] = caption
+        if reply_to:
+            data["reply_to_message_id"] = reply_to
+        files = {"video": video_path}
+
+        try:
+            result = await self._api_post_multipart("sendVideo", data, files)
+            if result.get("ok"):
+                sent_msg_id = str(result.get("result", {}).get("message_id", ""))
+                return SendResult(success=True, message_id=sent_msg_id)
+            return SendResult(success=False, error=str(result.get("description", "unknown error")))
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc))
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send audio as a native voice message via sendVoice API."""
+        if not self._http:
+            return SendResult(success=False, error="Not connected")
+        if not os.path.isfile(audio_path):
+            return SendResult(success=False, error=f"File not found: {audio_path}")
+
+        data = {"chat_id": chat_id}
+        if caption:
+            data["caption"] = caption
+        if reply_to:
+            data["reply_to_message_id"] = reply_to
+
+        last_error = ""
+        for attempt in range(3):
+            if attempt > 0:
+                if last_error and _looks_like_timeout(last_error):
+                    logger.warning(
+                        "[soroush] sendVoice attempt %d timed out — delivery state unknown, not retrying to avoid duplicates",
+                        attempt + 1,
+                    )
+                    break
+                await asyncio.sleep(1)
+            try:
+                result = await self._api_post_multipart("sendVoice", data, {"voice": audio_path})
+                if result.get("ok"):
+                    sent_msg_id = str(result.get("result", {}).get("message_id", ""))
+                    return SendResult(success=True, message_id=sent_msg_id)
+                last_error = str(result.get("description", "unknown error"))
+            except Exception as exc:
+                last_error = str(exc)
+
+        logger.warning("[soroush] sendVoice failed after 3 attempts: %s", last_error)
+        return SendResult(success=False, error=last_error)
+
+    async def send_audio(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ) -> SendResult:
+        """Send audio file — same as send_voice for Soroush."""
+        return await self.send_voice(
+            chat_id=chat_id, audio_path=audio_path,
+            caption=caption, reply_to=reply_to, metadata=metadata, **kwargs,
+        )
+
 
 # ---------------------------------------------------------------------------
-# Standalone sender (for cron delivery without a live gateway)
+# Standalone sender (for cron delivery without a live adapter)
 # ---------------------------------------------------------------------------
 
 
@@ -647,31 +808,27 @@ async def _standalone_send(
     media_files: Optional[List[str]] = None,
     force_document: bool = False,
 ) -> Dict[str, Any]:
-    """Send a message via PySPlusthon without a live adapter."""
+    """Send message via Soroush Bot API without a live adapter."""
+    import aiohttp
+
     extra = getattr(pconfig, "extra", {}) or {}
     token = str(extra.get("bot_token") or os.getenv("SOROUSH_BOT_TOKEN", ""))
     if not token:
-        return {"error": "Soroush standalone: SOROUSH_BOT_TOKEN required"}
+        return {"error": "Soroush standalone send: SOROUSH_BOT_TOKEN required"}
 
+    url = _api_url(token, "sendMessage")
     try:
-        from PySPlusthon import Client
-
-        client = Client(token)
-        await client.initialize()
-        await client.connect()
-        try:
-            if media_files:
-                sent = []
-                for f in media_files:
-                    if os.path.isfile(f):
-                        msg = await client.send_document(chat_id, f, caption=message or None)
-                        sent.append(str(getattr(msg, "id", "") or getattr(msg, "message_id", "")))
-                return {"success": True, "message_id": ",".join(sent)}
-            msg = await client.send_message(chat_id, message)
-            return {"success": True, "message_id": str(getattr(msg, "id", "") or getattr(msg, "message_id", ""))}
-        finally:
-            await client.disconnect()
-            await client.shutdown()
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30.0), trust_env=True
+        ) as session:
+            async with session.post(url, json={"chat_id": chat_id, "text": message}) as resp:
+                data = await resp.json()
+                if data.get("ok"):
+                    return {
+                        "success": True,
+                        "message_id": str(data.get("result", {}).get("message_id", "")),
+                    }
+                return {"error": data.get("description", "unknown error")}
     except Exception as exc:
         return {"error": f"Soroush send failed: {exc}"}
 
@@ -690,7 +847,7 @@ def register(ctx) -> None:
         validate_config=validate_config,
         is_connected=is_connected,
         required_env=["SOROUSH_BOT_TOKEN"],
-        install_hint="pip install PySPlusthon",
+        install_hint="",
         setup_fn=interactive_setup,
         env_enablement_fn=_env_enablement,
         cron_deliver_env_var="SOROUSH_HOME_CHANNEL",

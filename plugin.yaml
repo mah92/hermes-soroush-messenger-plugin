@@ -4,9 +4,9 @@ kind: platform
 version: 1.1.0
 description: |
   Soroush Plus (سروش پلاس) platform adapter for Hermes Agent.
-  Connects via PySPlusthon (official Soroush Plus Bot API at
-  https://api.splus.ir/bot<TOKEN>/...) — like Bale/Telegram bots.
-  Requires a Soroush bot token issued by Soroush's official channels.
+  Direct official Bot API (https://api.splus.ir/bot<TOKEN>/...) —
+  Telegram-compatible REST, no third-party SDK. Requires a Soroush
+  bot token from splus.ir/botfather.
 author: علی محمودی (mah92)
 requires_env:
   - name: SOROUSH_BOT_TOKEN

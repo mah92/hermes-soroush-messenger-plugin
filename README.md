@@ -4,24 +4,22 @@
 
 ## روش کار
 
-سروش‌پلاس یک Bot API رسمی دارد (شبیه بله/تلگرام) در آدرس:
+سروش‌پلاس یک Bot API رسمی و عمومی دارد (شبیه بله/تلگرام):
 
 ```
 https://api.splus.ir/bot<TOKEN>/<method>
 ```
 
-این پلاگین از کتابخانه **PySPlusthon** (روی PyPI) استفاده می‌کند که همین Bot API
-را پیاده‌سازی کرده — ارسال/دریافت متن، عکس، ویدیو، صدا، فایل، کیبورد و...
+این پلاگین **مستقیم** با همین Bot API کار می‌کند (HTTP + JSON با aiohttp) —
+هیچ وابستگی SDK اضافه‌ای ندارد (برخلاف PySPlusthon که سنگین و باگ‌دار بود).
+
+مستندات رسمی: https://soroushplus.com/p/documents/bot-platform
 
 ## گرفتن توکن ربات
 
-سروش‌پلاس مثل بله `@BotFather` عمومی و آزاد ندارد؛ توکن ربات از طریق
-**کانال‌های رسمی سروش** صادر می‌شود:
+سروش‌پلاس **ربات‌ساز رسمی** دارد:
 
-- کانال توسعه‌دهندگان: https://splus.ir/PySPlusthonDevelopers
-- کانال خبری کتابخانه: https://splus.ir/PySPlusthon
-
-برای کسب‌وکارها، درخواست ربات رسمی معمولاً از طریق پنل سازمانی/تجاری سروش انجام می‌شود.
+- **https://splus.ir/botfather** — ربات‌ساز رسمی سروش (توکن می‌دهد)
 
 ## امکانات
 
@@ -31,20 +29,22 @@ https://api.splus.ir/bot<TOKEN>/<method>
 - صدا (voice/audio) — ارسال و دریافت
 - ویدیو — ارسال و دریافت
 - فایل/مستند — ارسال و دریافت
-- کیبورد و دکمه‌ها
-- پشتیبانی از گروه و کانال
+- پشتیبانی از گروه و کانال (با گیت اختیاری @mention)
 - لیست مجاز کاربران/چت‌ها (allowlist)
-- تحویل پیام‌های cron
+- تحویل پیام‌های cron (standalone sender)
 
 ## نصب
 
 ```bash
-# وابستگی
-pip install PySPlusthon
+# clone
+cd ~/.hermes/plugins/platforms/
+git clone https://github.com/mah92/hermes-sorush-messenger-plugin.git soroush
 
-# فعال‌سازی پلاگین
-hermes plugins enable hermes-soroush-messenger
+# فعال‌سازی
+hermes plugins enable hermes-sorush-messenger
 ```
+
+وابستگی: فقط `aiohttp` (که معمولاً نصب است).
 
 ## تنظیم
 
@@ -53,27 +53,24 @@ hermes plugins enable hermes-soroush-messenger
 ```env
 SOROUSH_BOT_TOKEN=12345:ABC...
 SOROUSH_HOME_CHANNEL=<chat_id اختیاری>
+SOROUSH_ALLOWED_USERS=<user_id خودت>  # تا فقط خودت مجاز باشی
 ```
 
-سپس گیتوی را ریاستارت کنید:
-
-```bash
-hermes gateway restart
-```
+سپس گیتوی را ریاستارت کنید.
 
 ## متغیرهای محیطی
 
 | متغیر | الزامی | توضیح |
 |-------|--------|--------|
-| `SOROUSH_BOT_TOKEN` | ✅ | توکن ربات سروش |
+| `SOROUSH_BOT_TOKEN` | ✅ | توکن ربات سروش (از splus.ir/botfather) |
 | `SOROUSH_HOME_CHANNEL` | خیر | چت پیش‌فرض برای cron |
 | `SOROUSH_ALLOWED_CHATS` | خیر | فقط این چت‌ها مجازند |
 | `SOROUSH_ALLOWED_USERS` | خیر | فقط این کاربران مجازند |
 | `SOROUSH_ALLOW_ALL_USERS` | خیر | `true` = همه مجاز |
+| `SOROUSH_REQUIRE_MENTION` | خیر | `true` = در گروه‌ها فقط با @mention جواب بده |
 
 ## نکات
 
 - سروش فقط متن ساده پشتیبانی می‌کند — پلاگین مارک‌داون را پاک می‌کند.
-- ربات نمی‌تواند اول پیام دهد — کاربر باید اول `/start` یا پیام بفرستد.
-- حلقه پیام خود ربات مسدود شده (پیام‌های خود ربات ایگنور می‌شوند).
+- ربات نمی‌تواند اول پیام دهد — کاربر باید اول به ربات پیام بفرستد.
 - اگر پلاگین بوت نشد لاگ را ببینید: `hermes gateway status` / `journalctl -u hermes-gateway -n 50`
